@@ -10,14 +10,15 @@
  */
 #include "Arduino.h"
 #include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <Adafruit_NeoPixel.h>
 #include <MFRC522.h>
-#include <ReefwingMPU6x00.h>
+#include <MPU6500_WE.h>
 
 // ==========================================
-// SPI Pins Configuration (ESP32-C3-Zero)
+// Pins Configuration (ESP32-C3-Zero)
 // ==========================================
 #define SPI_MISO 2
 #define SPI_MOSI 7
@@ -25,8 +26,7 @@
 
 // Chip Select Pins
 #define TFT_CS_PIN 5
-#define RFID_CS_PIN 8
-#define IMU_CS_PIN 9
+#define RFID_CS_PIN 0
 
 // Display Control Pins
 #define TFT_DC_PIN 4
@@ -35,7 +35,12 @@
 // RFID Control Pins
 #define RFID_RST_PIN 1
 
-// NeoPixel (onboard Adafruit LED) pin (originally GPIO10)
+// I2C Pins for MPU6500
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define MPU6500_ADDR 0x68
+
+// NeoPixel (onboard Adafruit LED) pin
 #define NEOPIXEL_PIN 10
 
 // ==========================================
@@ -47,11 +52,11 @@ Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
 // NeoPixel instance (single LED)
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-// MFRC522 (SPI with CS on GPIO8)
+// MFRC522 (SPI with CS on GPIO0)
 MFRC522 mfrc522(RFID_CS_PIN, RFID_RST_PIN);
 
-// MPU6500 (SPI with CS on GPIO9)
-static MPU6500 imu = MPU6500(SPI, IMU_CS_PIN);
+// MPU6500 (I2C on GPIO8/GPIO9)
+MPU6500_WE imu = MPU6500_WE(MPU6500_ADDR);
 
 // ==========================================
 // Global Variables
@@ -159,12 +164,10 @@ void initializeSPI()
   // Set up chip select pins as outputs
   pinMode(TFT_CS_PIN, OUTPUT);
   pinMode(RFID_CS_PIN, OUTPUT);
-  pinMode(IMU_CS_PIN, OUTPUT);
   
   // Ensure all CS pins are high (inactive)
   digitalWrite(TFT_CS_PIN, HIGH);
   digitalWrite(RFID_CS_PIN, HIGH);
-  digitalWrite(IMU_CS_PIN, HIGH);
   
   Serial.println("SPI Bus initialized");
 }
@@ -202,20 +205,37 @@ void initializeRFID()
 
 void initializeIMU()
 {
-  Serial.println("initializing MPU6500 IMU...");
+  Serial.println("Initializing MPU6500 IMU (I2C)...");
 
-  // Initialize the IMU using the Reefwing library
-  while (!imu.begin()) 
+  // Initialize I2C bus BEFORE device initialization
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);  // Start I2C with 400kHz clock
+  delay(100);
+
+  // Initialize MPU9250
+  if (!imu.init())
   {
-    Serial.println("Failed");
-    delay(100);
+    Serial.println("ERROR: MPU6500 initialization failed!");
   }
-    Serial.println("Success");
+  else
+  {
+    Serial.println("MPU6500 initialization successful");
+    
+    Serial.println("Position you MPU6500 flat and don't move it - calibrating...");
+    delay(1000);
+    imu.autoOffsets();
+    Serial.println("Done!");
 
-    //  Calibrate IMU for Bias Offset
-    Serial.println("Calibrating IMU - no movement please!");
-    imu.calibrateAccelGyro();
-    Serial.println("IMU Calibrated.");
+    imu.enableGyrDLPF();
+    imu.setGyrDLPF(MPU6500_DLPF_6);
+    imu.setSampleRateDivider(5);
+    imu.setGyrRange(MPU6500_GYRO_RANGE_250);
+    imu.setAccRange(MPU6500_ACC_RANGE_2G);
+    imu.enableAccDLPF(true);
+    imu.setAccDLPF(MPU6500_DLPF_6);
+    delay(200);
+  }
+
+  Serial.println("IMU initialized");
 }
 
 // ==========================================
@@ -248,36 +268,42 @@ void updateCountdownDisplay()
 }
 
 void handleMPU() {
-    if (imu.dataAvailable()) {
-      imu.readSensor();
-      imu.getCalibratedGyro(gx, gy, gz);
-      imu.getCalibratedAccel(ax, ay, az);
-      imu.getTemp(mpuTemp);
-    }
+    // Read sensor data from MPU9250
+    xyzFloat gyroValues = imu.getGyrValues();  // Get gyro in DPS
+    xyzFloat accelValues = imu.getGValues();    // Get accel in G
+    
+    gx = gyroValues.x;
+    gy = gyroValues.y;
+    gz = gyroValues.z;
+    
+    ax = accelValues.x;
+    ay = accelValues.y;
+    az = accelValues.z;
+    
+    mpuTemp = imu.getTemperature();
 
+    // Display sensor data every mpuPeriod, non-blocking
     if (millis() - previousMillis >= mpuPeriod) {
-    //  Display sensor data every mpuPeriod, non-blocking.
-    Serial.print("Gyro X: ");
-    Serial.print(gx);
-    Serial.print("\tGyro Y: ");
-    Serial.print(gy);
-    Serial.print("\tGyro Z: ");
-    Serial.print(gz);
-    Serial.print(" DPS");
-  
-    Serial.print("Accel X: ");
-    Serial.print(ax);
-    Serial.print("\tAccel Y: ");
-    Serial.print(ay);
-    Serial.print("\tAccel Z: ");
-    Serial.print(az);
-    Serial.println(" G'S");
+      Serial.print("Gyro X: ");
+      Serial.print(gx);
+      Serial.print("\tGyro Y: ");
+      Serial.print(gy);
+      Serial.print("\tGyro Z: ");
+      Serial.print(gz);
+      Serial.print(" DPS");
+    
+      Serial.print("Accel X: ");
+      Serial.print(ax);
+      Serial.print("\tAccel Y: ");
+      Serial.print(ay);
+      Serial.print("\tAccel Z: ");
+      Serial.print(az);
+      Serial.println(" G'S");
 
-    Serial.print("Temp: ");
-    Serial.print(mpuTemp);
-    Serial.println(" C\n");
+      Serial.print("Temp: ");
+      Serial.print(mpuTemp);
+      Serial.println(" C\n");
 
-    previousMillis = millis();
-  }
-
+      previousMillis = millis();
+    }
 }
