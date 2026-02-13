@@ -17,6 +17,16 @@
 #include <MFRC522.h>
 #include <MPU6500_WE.h>
 
+// Mainly for time synchronization
+#include <WiFi.h>
+#include <ezTime.h>
+
+// Persistant storage
+#include <Preferences.h>
+
+//WIFI_SSID, SSID_PSK
+#include "secrets.h"
+
 // ==========================================
 // Pins Configuration (ESP32-C3-Zero)
 // ==========================================
@@ -43,6 +53,18 @@
 // NeoPixel (onboard Adafruit LED) pin
 #define NEOPIXEL_PIN 10
 
+// Countdown defines
+#define TRIGGER_ANGLE 60.0  // Degrees of tilt to start countdown
+
+// ==========================================
+// Types
+// ==========================================
+typedef enum CountdownState {
+  COUNTDOWN_ACTIVE,
+  COUNTDOWN_STOPPED
+} countdownState_t;
+
+
 // ==========================================
 // Device Instances
 // ==========================================
@@ -58,15 +80,17 @@ MFRC522 mfrc522(RFID_CS_PIN, RFID_RST_PIN);
 // MPU6500 (I2C on GPIO8/GPIO9)
 MPU6500_WE imu = MPU6500_WE(MPU6500_ADDR);
 
+Preferences prefs;
+
 // ==========================================
 // Global Variables
 // ==========================================
-unsigned long lastUpdateTime = 0;
-int countdownValue = 3600;  // Start at 3600 seconds (1 hour)
+static uint32_t lastUpdateTime = 0;
+static int32_t countdownValue = 600;  // Start at 600 seconds (10 minutes)
+static uint32_t lastDayOfYear = 0;
 
-float gx, gy, gz, ax, ay, az, mpuTemp = 0.0f;
-const long mpuPeriod = 1000;
-unsigned long previousMillis = 0;
+static countdownState_t countdownState = COUNTDOWN_STOPPED;
+
 // ==========================================
 // Function Declarations
 // ==========================================
@@ -75,7 +99,11 @@ void initializeDisplay();
 void initializeRFID();
 void initializeIMU();
 void updateCountdownDisplay();
+void handleRFID();
 void handleMPU();
+void handleTimeChange();
+void countdownActive();
+void countdownStopped();
 
 // ==========================================
 // Setup Function
@@ -83,29 +111,57 @@ void handleMPU();
 void setup()
 {
   Serial.begin(115200);
-  delay(1000);
+  delay(1000); // Wait for serial to initialize
+  while(!Serial);
   
   Serial.println("\n\nDigital Hourglass Starting...");
+
+  // Initialize NeoPixel
+  pixels.begin();
+  pixels.fill(pixels.Color(255, 0, 0), 0, 1);
+  pixels.show();
     
   // Initialize SPI Bus
   initializeSPI();
   
   // Initialize Display
-  initializeDisplay();  
+  initializeDisplay(); 
+  pixels.fill(pixels.Color(0, 0, 255), 0, 1);
+  pixels.show(); 
 
   // Initialize RFID
   initializeRFID();
+  pixels.fill(pixels.Color(255, 255, 0), 0, 1);
+  pixels.show(); 
 
   // Initialize IMU
   initializeIMU();
+  pixels.fill(pixels.Color(0, 255, 0), 0, 1);
+  pixels.show(); 
   
   Serial.println("All devices initialized successfully!");
+
+  // Initialize WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.begin(WIFI_SSID, SSID_PSK);
+  setDebug(INFO);
+  waitForSync();
+
+	Serial.println();
+	Serial.println("UTC:             " + UTC.dateTime());
+  Serial.println("Day of Year:     " + String(dayOfYear()));
+
+  // Setup persistent storage
+  prefs.begin("hourglass", false);
+  countdownValue = prefs.getInt("countdown", 600);  // Default to 600 seconds if not set
+  lastDayOfYear = prefs.getUInt("dayOfYear", dayOfYear());
+  updateCountdownDisplay();
   
   // Set initial display update time
   lastUpdateTime = millis();
 
-  // Initialize NeoPixel and ensure it's off after initialization
-  pixels.begin();
+  // Set NeoPixel to Off
   pixels.fill(pixels.Color(0, 0, 0), 0, 1);
   pixels.show();
 }
@@ -115,39 +171,31 @@ void setup()
 // ==========================================
 void loop()
 {
-  unsigned long currentTime = millis();
-  
-  // Update countdown every 1000ms (1 second)
-  if (currentTime - lastUpdateTime >= 1000)
-  {
-    lastUpdateTime = currentTime;
-    countdownValue--;
-    
-    // Reset countdown when it reaches 0
-    if (countdownValue < 0)
-    {
-      countdownValue = 3600;
-    }
-    
-    updateCountdownDisplay();
-  }
-  
-  // Check for RFID cards
-  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
-  {
-    Serial.print("Card UID: ");
-    for (byte i = 0; i < mfrc522.uid.size; i++)
-    {
-      Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
-      Serial.print(mfrc522.uid.uidByte[i], HEX);
-    }
-    Serial.println();
-    mfrc522.PICC_HaltA();
-  }
 
+  switch (countdownState)
+  {
+    case COUNTDOWN_STOPPED:
+      countdownStopped();
+      break;
+    case COUNTDOWN_ACTIVE:
+      // Countdown logic handled below
+      countdownActive();
+      break;
+    default:
+      countdownState = COUNTDOWN_STOPPED;
+      break;
+  }
+   
+  //check RFID Tags
+  handleRFID();
+
+  //Check MPU
   handleMPU();
+
+  //handle Time change
+  handleTimeChange();
   
-  delay(10);
+  delay(100);
 }
 
 // ==========================================
@@ -181,12 +229,14 @@ void initializeDisplay()
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
 
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(20, 10);
-  tft.println("COUNTDOWN");
+  // Clear the counter area (save bandwidth by only updating needed area)
+  tft.fillRect(15, 60, 100, 40, ST77XX_BLACK);
 
-  updateCountdownDisplay();
+  // Draw large counter
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setTextSize(4);
+  tft.setCursor(25, 50);
+  tft.println("--:--");
 
   Serial.println("Display initialized");
 }
@@ -245,14 +295,12 @@ void initializeIMU()
 void updateCountdownDisplay()
 {
   // Convert countdown seconds to MM:SS format
-  int minutes = countdownValue / 60;
-  int seconds = countdownValue % 60;
+  int32_t minutes = countdownValue / 60;
+  int32_t seconds = countdownValue % 60;
   
   // Create time string
   char timeStr[16];
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d", minutes, seconds);
-  
-  digitalWrite(TFT_CS_PIN, LOW);
   
   // Clear the counter area (save bandwidth by only updating needed area)
   tft.fillRect(15, 60, 100, 40, ST77XX_BLACK);
@@ -260,50 +308,142 @@ void updateCountdownDisplay()
   // Draw large counter
   tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
   tft.setTextSize(4);
-  tft.setCursor(25, 65);
+  tft.setCursor(25, 50);
   tft.println(timeStr);
-
-  
-  digitalWrite(TFT_CS_PIN, HIGH);
 }
 
-void handleMPU() {
-    // Read sensor data from MPU9250
-    xyzFloat gyroValues = imu.getGyrValues();  // Get gyro in DPS
-    xyzFloat accelValues = imu.getGValues();    // Get accel in G
-    
-    gx = gyroValues.x;
-    gy = gyroValues.y;
-    gz = gyroValues.z;
-    
-    ax = accelValues.x;
-    ay = accelValues.y;
-    az = accelValues.z;
-    
-    mpuTemp = imu.getTemperature();
-
-    // Display sensor data every mpuPeriod, non-blocking
-    if (millis() - previousMillis >= mpuPeriod) {
-      Serial.print("Gyro X: ");
-      Serial.print(gx);
-      Serial.print("\tGyro Y: ");
-      Serial.print(gy);
-      Serial.print("\tGyro Z: ");
-      Serial.print(gz);
-      Serial.print(" DPS");
-    
-      Serial.print("Accel X: ");
-      Serial.print(ax);
-      Serial.print("\tAccel Y: ");
-      Serial.print(ay);
-      Serial.print("\tAccel Z: ");
-      Serial.print(az);
-      Serial.println(" G'S");
-
-      Serial.print("Temp: ");
-      Serial.print(mpuTemp);
-      Serial.println(" C\n");
-
-      previousMillis = millis();
+// ==========================================
+// Handle RFID Tags
+// ==========================================
+void handleRFID() {
+    // Check for RFID cards
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
+  {
+    Serial.print("Card UID: ");
+    for (byte i = 0; i < mfrc522.uid.size; i++)
+    {
+      Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+      Serial.print(mfrc522.uid.uidByte[i], HEX);
     }
+    Serial.println();
+    mfrc522.PICC_HaltA();
+  }
+}
+
+// ==========================================
+// Handle MPU
+// ==========================================
+void handleMPU() {
+  static const int32_t mpuPeriod = 1000;
+  static uint32_t previousMillis = 0;
+  // Read sensor data from MPU9250
+  xyzFloat angles = imu.getAngles();          // Get angles in degrees
+      
+  float mpuTemp = imu.getTemperature();
+
+  // Display sensor data every mpuPeriod, non-blocking
+  if (millis() - previousMillis >= mpuPeriod) {
+    Serial.print("Angles X: ");
+    Serial.print(angles.x);
+    Serial.print("\tAngles Y: ");
+    Serial.print(angles.y);
+    Serial.print("\tAngles Z: ");
+    Serial.print(angles.z);
+    Serial.println(" Degrees");
+
+    Serial.print("Temp: ");
+    Serial.print(mpuTemp);
+    Serial.println(" C\n");
+
+    previousMillis = millis();
+
+    if (angles.y >= TRIGGER_ANGLE) {
+      if (countdownState != COUNTDOWN_ACTIVE)
+      {
+        Serial.println("Device tilted forward - starting countdown");
+        countdownState = COUNTDOWN_ACTIVE;
+        pixels.fill(pixels.Color(255, 255, 0), 0, 1);
+        pixels.show();
+      }    
+    }
+    else {
+      if (countdownState != COUNTDOWN_STOPPED)
+      {
+        Serial.println("Device tilted backward - stopping countdown");
+        countdownState = COUNTDOWN_STOPPED;
+        pixels.fill(pixels.Color(0, 0, 0), 0, 1);
+        pixels.show();
+      }
+    }
+  }
+}
+
+// ==========================================
+// Handle Time Change
+// ==========================================
+void handleTimeChange() {
+  static uint32_t lastCheckedTime = 0;
+  uint32_t currentTime = millis();
+  if (currentTime - lastCheckedTime > 3600000)
+  {
+    lastCheckedTime = currentTime;
+    uint32_t currentDayOfYear = dayOfYear();
+    if (currentDayOfYear != lastDayOfYear) 
+    {
+      Serial.println("Day of year changed - resetting countdown");
+      countdownValue = 600; // Reset countdown to 10 minutes
+      updateCountdownDisplay();
+      lastDayOfYear = currentDayOfYear;
+      prefs.putInt("countdown", countdownValue);
+      prefs.putUInt("dayOfYear", lastDayOfYear);
+    }
+  }
+}
+
+// ==========================================
+// Countdown Functions
+// ==========================================
+void countdownActive() {
+  static uint32_t lastSavedTime = 0;
+  uint32_t currentTime = millis();
+    // Update countdown every 1000ms (1 second)
+  if (currentTime - lastUpdateTime >= 1000)
+  {
+    countdownValue -= (currentTime - lastUpdateTime) / 1000;
+    lastUpdateTime = currentTime;
+    
+    // Leave Countdown at 0, set LED to red
+    if (countdownValue < 0)
+    {
+      countdownValue = 0;
+      pixels.fill(pixels.Color(255, 0, 0), 0, 1);
+      pixels.show();
+    }
+    else 
+    {
+      pixels.fill(pixels.Color(0, 255, 0), 0, 1);
+      pixels.show();
+    }
+    
+    updateCountdownDisplay();
+
+    if (currentTime - lastSavedTime >= 60000) // Save every 60 seconds
+    {
+      prefs.putInt("countdown", countdownValue);
+      lastSavedTime = currentTime;
+    }
+  }
+}
+
+void countdownStopped() {
+  static int32_t lastCountdownValue = countdownValue;
+  if (countdownValue != lastCountdownValue) 
+  {
+    lastCountdownValue = countdownValue;
+    updateCountdownDisplay();
+
+    prefs.putInt("countdown", countdownValue);
+    prefs.putUInt("dayOfYear", dayOfYear());
+  }
+  lastUpdateTime = millis();
 }

@@ -2,4 +2,5 @@
 .vscode
 MFRC522
 ReefwingMPU6x00
+include/secrets.h
 
