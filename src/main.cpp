@@ -8,7 +8,6 @@
  * 
  * Features: Countdown counter displayed on TFT screen
  */
-
 #include "Arduino.h"
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -49,7 +48,7 @@ Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // MFRC522 (SPI with CS on GPIO8)
-MFRC522 mfrc522(RFID_CS_PIN, UINT8_MAX);
+MFRC522 mfrc522(RFID_CS_PIN, RFID_RST_PIN);
 
 // MPU6500 (SPI with CS on GPIO9)
 static MPU6500 imu = MPU6500(SPI, IMU_CS_PIN);
@@ -60,6 +59,9 @@ static MPU6500 imu = MPU6500(SPI, IMU_CS_PIN);
 unsigned long lastUpdateTime = 0;
 int countdownValue = 3600;  // Start at 3600 seconds (1 hour)
 
+float gx, gy, gz, ax, ay, az, mpuTemp = 0.0f;
+const long mpuPeriod = 1000;
+unsigned long previousMillis = 0;
 // ==========================================
 // Function Declarations
 // ==========================================
@@ -68,6 +70,7 @@ void initializeDisplay();
 void initializeRFID();
 void initializeIMU();
 void updateCountdownDisplay();
+void handleMPU();
 
 // ==========================================
 // Setup Function
@@ -79,15 +82,15 @@ void setup()
   
   Serial.println("\n\nDigital Hourglass Starting...");
     
-    // Initialize RFID
-  initializeRFID();
-
   // Initialize SPI Bus
   initializeSPI();
   
   // Initialize Display
   initializeDisplay();  
-  
+
+  // Initialize RFID
+  initializeRFID();
+
   // Initialize IMU
   initializeIMU();
   
@@ -136,6 +139,8 @@ void loop()
     Serial.println();
     mfrc522.PICC_HaltA();
   }
+
+  handleMPU();
   
   delay(10);
 }
@@ -149,7 +154,7 @@ void initializeSPI()
   Serial.println("Initializing SPI Bus (FSPI)...");
   
   // Configure SPI bus (using FSPI)
-  SPI.begin(SPI_SCLK, SPI_MISO, SPI_MOSI, -1);
+  SPI.begin(SPI_SCLK, SPI_MISO, SPI_MOSI, RFID_CS_PIN);
   
   // Set up chip select pins as outputs
   pinMode(TFT_CS_PIN, OUTPUT);
@@ -168,8 +173,6 @@ void initializeDisplay()
 {
   Serial.println("Initializing TFT Display...");
 
-  digitalWrite(TFT_CS_PIN, LOW);
-
   // Initialize Adafruit ST7735 (use a common init for ST7735R)
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
@@ -181,9 +184,6 @@ void initializeDisplay()
   tft.println("COUNTDOWN");
 
   updateCountdownDisplay();
-
-  // Deassert CS
-  digitalWrite(TFT_CS_PIN, HIGH);
 
   Serial.println("Display initialized");
 }
@@ -202,9 +202,20 @@ void initializeRFID()
 
 void initializeIMU()
 {
-  Serial.println("Initializing MPU6500 IMU...");
-  // IMU initialization deferred
-  Serial.println("IMU initialized");
+  Serial.println("initializing MPU6500 IMU...");
+
+  // Initialize the IMU using the Reefwing library
+  while (!imu.begin()) 
+  {
+    Serial.println("Failed");
+    delay(100);
+  }
+    Serial.println("Success");
+
+    //  Calibrate IMU for Bias Offset
+    Serial.println("Calibrating IMU - no movement please!");
+    imu.calibrateAccelGyro();
+    Serial.println("IMU Calibrated.");
 }
 
 // ==========================================
@@ -234,7 +245,39 @@ void updateCountdownDisplay()
 
   
   digitalWrite(TFT_CS_PIN, HIGH);
+}
+
+void handleMPU() {
+    if (imu.dataAvailable()) {
+      imu.readSensor();
+      imu.getCalibratedGyro(gx, gy, gz);
+      imu.getCalibratedAccel(ax, ay, az);
+      imu.getTemp(mpuTemp);
+    }
+
+    if (millis() - previousMillis >= mpuPeriod) {
+    //  Display sensor data every mpuPeriod, non-blocking.
+    Serial.print("Gyro X: ");
+    Serial.print(gx);
+    Serial.print("\tGyro Y: ");
+    Serial.print(gy);
+    Serial.print("\tGyro Z: ");
+    Serial.print(gz);
+    Serial.print(" DPS");
   
-  Serial.print("Countdown: ");
-  Serial.println(timeStr);
+    Serial.print("Accel X: ");
+    Serial.print(ax);
+    Serial.print("\tAccel Y: ");
+    Serial.print(ay);
+    Serial.print("\tAccel Z: ");
+    Serial.print(az);
+    Serial.println(" G'S");
+
+    Serial.print("Temp: ");
+    Serial.print(mpuTemp);
+    Serial.println(" C\n");
+
+    previousMillis = millis();
+  }
+
 }
