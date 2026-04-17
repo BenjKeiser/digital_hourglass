@@ -21,7 +21,7 @@
 #include <WiFi.h>
 #include <ezTime.h>
 
-// Persistant storage
+// Persistent storage
 #include <Preferences.h>
 
 //WIFI_SSID, SSID_PSK
@@ -237,7 +237,7 @@ void initializeDisplay()
 
   // Initialize Adafruit ST7735 (use a common init for ST7735R)
   tft.initR(INITR_BLACKTAB);
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
 
   // Clear the counter area (save bandwidth by only updating needed area)
@@ -272,7 +272,7 @@ void initializeIMU()
   Wire.begin(I2C_SDA, I2C_SCL, 400000);  // Start I2C with 400kHz clock
   delay(100);
 
-  // Initialize MPU9250
+  // Initialize MPU6500
   if (!imu.init())
   {
     Serial.println("ERROR: MPU6500 initialization failed!");
@@ -286,14 +286,6 @@ void initializeIMU()
     imu.autoOffsets();
     Serial.println("Done!");
 
-    imu.enableGyrDLPF();
-    imu.setGyrDLPF(MPU6500_DLPF_6);
-    imu.setSampleRateDivider(5);
-    imu.setGyrRange(MPU6500_GYRO_RANGE_250);
-    imu.setAccRange(MPU6500_ACC_RANGE_2G);
-    imu.enableAccDLPF(true);
-    imu.setAccDLPF(MPU6500_DLPF_6);
-    delay(200);
   }
 
   Serial.println("IMU initialized");
@@ -355,67 +347,50 @@ void handleRFID() {
       return;
     }
 
-    // Prepare default key (most cards ship with all 0xFF)
+    // NDEF data sector key
     MFRC522::MIFARE_Key key;
-    for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+    key.keyByte[0] = 0xD3; 
+    key.keyByte[1] = 0xF7;
+    key.keyByte[2] = 0xD3; 
+    key.keyByte[3] = 0xF7;
+    key.keyByte[4] = 0xD3; 
+    key.keyByte[5] = 0xF7;
 
     bool foundValidPayload = false;
     String foundPayload;
 
-    for (byte block = 1; block < 16 && !foundValidPayload; block++)
-    {
-      byte buffer[18] = {0};
-      byte size = sizeof(buffer);
+    // NDEF data is in sector 1 (blocks 4-6), authenticate with block 4
+    MFRC522::StatusCode authStatus = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 4, &key, &(mfrc522.uid));
 
-      // Try MIFARE Classic auth then read
-      if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid)) == MFRC522::STATUS_OK)
+    if (authStatus == MFRC522::STATUS_OK)
+    {
+      // Read blocks 4, 5, 6 in sector 1
+      for (byte block = 4; block <= 6 && !foundValidPayload; block++)
       {
-        if (mfrc522.MIFARE_Read(block, buffer, &size) == MFRC522::STATUS_OK)
+        byte buffer[18] = {0};
+        byte size = sizeof(buffer);
+
+        if (mfrc522.MIFARE_Read(block, buffer, &size) != MFRC522::STATUS_OK)
+          continue;
+
+        String payload = String((char*)buffer);
+        payload.trim();
+
+        int cmdIdx = payload.indexOf("ADD");
+        if (cmdIdx < 0) cmdIdx = payload.indexOf("SUB");
+        if (cmdIdx >= 0 && cmdIdx + 4 <= (int)payload.length())
         {
-          String payload = String((char*)buffer);
-          payload.trim();
-          if (payload.length() == 4 && (payload.startsWith("ADD") || payload.startsWith("SUB")))
-          {
-            foundValidPayload = true;
-            foundPayload = payload;
-          }
-        }
-        mfrc522.PCD_StopCrypto1();
-      }
-      else
-      {
-        // Try non-auth read (NTAG/Ultralight style)
-        if (mfrc522.MIFARE_Read(block, buffer, &size) == MFRC522::STATUS_OK)
-        {
-          String payload = String((char*)buffer);
-          payload.trim();
-          if (payload.length() == 4 && (payload.startsWith("ADD") || payload.startsWith("SUB")))
-          {
-            foundValidPayload = true;
-            foundPayload = payload;
-          }
+          foundValidPayload = true;
+          foundPayload = payload.substring(cmdIdx, cmdIdx + 4);
         }
       }
+      mfrc522.PCD_StopCrypto1();
     }
-
-    if (!foundValidPayload)
+    else
     {
-      Serial.println(F("RFID payload not found in scanned blocks. UID mapping fallback."));
-
-      String uidHex;
-      for (byte i = 0; i < mfrc522.uid.size; i++)
-      {
-        if (mfrc522.uid.uidByte[i] < 0x10) uidHex += "0";
-        uidHex += String(mfrc522.uid.uidByte[i], HEX);
-      }
-
-      if (uidHex.equalsIgnoreCase("1168EFA2"))
-      {
-        foundValidPayload = true;
-        foundPayload = "ADD1"; // custom UID mapping for your card
-        Serial.println(F("UID mapping matched to ADD1"));
-      }
+      Serial.println("RFID auth FAIL");
     }
+
 
     if (foundValidPayload)
     {
@@ -487,6 +462,50 @@ void handleRFID() {
 void handleMPU() {
   static const int32_t mpuPeriod = 1000;
   static uint32_t previousMillis = 0;
+  
+  xyzFloat angles = imu.getAngles();
+  //xyzFloat accel = imu.getCorrectedAccRawValues();  // Get raw acceleration
+  
+  if (millis() - previousMillis >= mpuPeriod) {
+    Serial.printf("Angles - X: %.2f  Y: %.2f  Z: %.2f\n", angles.x, angles.y, angles.z);
+    //Serial.printf("Accel - X: %.2f  Y: %.2f  Z: %.2f\n", accel.x, accel.y, accel.z);
+
+    bool isFlipped = (angles.z <= -TRIGGER_ANGLE);
+    
+    if (isFlipped) {
+      // Normal tilt - start countdown
+      if (countdownState != COUNTDOWN_ACTIVE) {
+        Serial.println("Device tilted - starting countdown");
+        countdownState = COUNTDOWN_ACTIVE;
+
+        // Rotate display 180 degrees to indicate active state
+        tft.setRotation(1);
+
+        // Set NeoPixel to Yellow
+        pixels.fill(pixels.Color(255, 255, 0), 0, 1);
+        pixels.show();
+      }
+    } else {
+      // Either not tilted OR flipped
+      if (countdownState != COUNTDOWN_STOPPED) {
+        Serial.println("Countdown stopped");
+        countdownState = COUNTDOWN_STOPPED;
+
+        // Rotate display back to default orientation
+        tft.setRotation(3);
+        
+        // Set NeoPixel to Off
+        pixels.fill(pixels.Color(0, 0, 0), 0, 1);
+        pixels.show();
+      }
+    }
+    previousMillis = millis();
+  }
+}
+#if 0
+void handleMPU() {
+  static const int32_t mpuPeriod = 1000;
+  static uint32_t previousMillis = 0;
   // Read sensor data from MPU9250
   xyzFloat angles = imu.getAngles();          // Get angles in degrees
 
@@ -538,6 +557,7 @@ void handleMPU() {
     }
   }
 }
+#endif
 
 // ==========================================
 // Handle Time Change
